@@ -65,6 +65,30 @@ class MediaRepository(context: Context) {
             .map { (path, count) -> Album(path, path.trimEnd('/').substringAfterLast('/'), count) }
             .sortedByDescending { it.count }
 
+    data class Detail(val pixels: Long, val bytes: Long)
+
+    /** Resolução e tamanho do arquivo, usados para escolher qual foto manter entre duplicadas. */
+    fun details(ids: Collection<Long>): Map<Long, Detail> {
+        val out = HashMap<Long, Detail>()
+        val projection = arrayOf(
+            MediaStore.Images.Media._ID,
+            MediaStore.Images.Media.WIDTH,
+            MediaStore.Images.Media.HEIGHT,
+            MediaStore.Images.Media.SIZE,
+        )
+        ids.chunked(500).forEach { chunk ->
+            resolver.query(
+                collection, projection,
+                "${MediaStore.Images.Media._ID} IN (${chunk.joinToString(",")})", null, null
+            )?.use { c ->
+                while (c.moveToNext()) {
+                    out[c.getLong(0)] = Detail(c.getLong(1) * c.getLong(2), c.getLong(3))
+                }
+            }
+        }
+        return out
+    }
+
     fun loadThumbnail(uri: Uri, size: Int = 320): Bitmap =
         resolver.loadThumbnail(uri, Size(size, size), null)
 

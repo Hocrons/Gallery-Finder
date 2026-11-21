@@ -15,7 +15,7 @@ import kotlin.math.sqrt
  * Transforma imagens e textos em vetores de 512 números; quanto mais parecidos os vetores,
  * mais a foto combina com a descrição.
  */
-class ClipModel(private val modelDir: File) : Closeable {
+class ClipModel(private val modelDir: File, private val threads: Int = 4) : Closeable {
 
     companion object {
         const val IMAGE_SIZE = 224
@@ -28,7 +28,7 @@ class ClipModel(private val modelDir: File) : Closeable {
 
     private fun options() = OrtSession.SessionOptions().apply {
         setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-        setIntraOpNumThreads(Runtime.getRuntime().availableProcessors().coerceIn(2, 6))
+        setIntraOpNumThreads(threads)
     }
 
     private val vision: OrtSession by lazy {

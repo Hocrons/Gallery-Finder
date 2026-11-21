@@ -8,7 +8,6 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
-import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
@@ -33,6 +32,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.galeriaia.app.update.Updater
 
 fun currentPermission(ctx: Context): PermissionState {
     fun granted(p: String) = ContextCompat.checkSelfPermission(ctx, p) == PackageManager.PERMISSION_GRANTED
@@ -48,8 +48,9 @@ fun permissionsToRequest(): Array<String> = when {
     Build.VERSION.SDK_INT >= 34 -> arrayOf(
         Manifest.permission.READ_MEDIA_IMAGES,
         Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED,
+        Manifest.permission.POST_NOTIFICATIONS,
     )
-    Build.VERSION.SDK_INT >= 33 -> arrayOf(Manifest.permission.READ_MEDIA_IMAGES)
+    Build.VERSION.SDK_INT >= 33 -> arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.POST_NOTIFICATIONS)
     else -> arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
 }
 
@@ -69,6 +70,15 @@ fun App(vm: MainViewModel = viewModel()) {
     val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         vm.onPermission(currentPermission(ctx))
     }
+    // Pede para mostrar notificação (progresso da indexação) e então inicia
+    val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        vm.startIndexing()
+    }
+    val startIndexing = {
+        val needsNotif = Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        if (needsNotif) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS) else vm.startIndexing()
+    }
 
     // Recheca permissão e fotos novas sempre que o app volta para a tela
     val lifecycle = LocalLifecycleOwner.current.lifecycle
@@ -80,12 +90,16 @@ fun App(vm: MainViewModel = viewModel()) {
         onDispose { lifecycle.removeObserver(obs) }
     }
 
-    // Mantém a tela ligada enquanto indexa (se a tela apagar, o Android pode pausar o app)
-    val indexing = state.indexProgress != null
-    DisposableEffect(indexing) {
-        val window = (ctx as? Activity)?.window
-        if (indexing) window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        onDispose { window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+    // Atualização baixada: abre o instalador (ou pede a liberação "instalar apps desconhecidos")
+    LaunchedEffect(state.installRequest) {
+        val apk = state.installRequest ?: return@LaunchedEffect
+        if (Updater.canInstall(ctx)) {
+            Updater.install(ctx, apk)
+        } else {
+            Updater.openInstallPermissionSettings(ctx)
+            snackbar.showSnackbar("Ative \"Permitir desta fonte\", volte e toque em Instalar de novo.")
+        }
+        vm.installHandled()
     }
 
     // Confirmações do sistema (Lixeira / permissão para mover)
@@ -103,7 +117,7 @@ fun App(vm: MainViewModel = viewModel()) {
         }
     }
 
-    BackHandler(enabled = state.screen == Screen.RESULTS) { vm.back() }
+    BackHandler(enabled = state.screen != Screen.HOME) { vm.back() }
 
     Box(Modifier.fillMaxSize()) {
         when (state.screen) {
@@ -113,8 +127,10 @@ fun App(vm: MainViewModel = viewModel()) {
                 snackbar = { SnackbarHost(snackbar) },
                 onRequestPermission = { permLauncher.launch(permissionsToRequest()) },
                 onOpenSettings = { openAppSettings(ctx) },
+                onStartIndexing = startIndexing,
             )
             Screen.RESULTS -> ResultsScreen(state = state, vm = vm, snackbar = { SnackbarHost(snackbar) })
+            Screen.DUPLICATES -> DuplicatesScreen(state = state, vm = vm, snackbar = { SnackbarHost(snackbar) })
         }
     }
 

@@ -225,8 +225,15 @@ private fun SearchInfo(result: SearchResult) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun Thumb(hit: Hit, selected: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
-    val primary = MaterialTheme.colorScheme.primary
+internal fun Thumb(
+    hit: Hit,
+    selected: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    selectedColor: Color = MaterialTheme.colorScheme.primary,
+    dimUnselected: Boolean = true,
+) {
+    val primary = selectedColor
     Box(
         Modifier
             .padding(2.dp)
@@ -239,7 +246,7 @@ private fun Thumb(hit: Hit, selected: Boolean, onClick: () -> Unit, onLongClick:
             model = hit.uri,
             contentDescription = null,
             contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxSize().alpha(if (selected) 1f else 0.35f),
+            modifier = Modifier.fillMaxSize().alpha(if (selected || !dimUnselected) 1f else 0.35f),
         )
         if (selected) {
             Icon(
@@ -257,7 +264,7 @@ private fun Thumb(hit: Hit, selected: Boolean, onClick: () -> Unit, onLongClick:
 }
 
 @Composable
-private fun PreviewDialog(hit: Hit, selected: Boolean, onToggle: () -> Unit, onDismiss: () -> Unit) {
+internal fun PreviewDialog(hit: Hit, selected: Boolean, onToggle: () -> Unit, onDismiss: () -> Unit) {
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(Modifier.fillMaxWidth().padding(12.dp), shape = RoundedCornerShape(16.dp)) {
             Column {

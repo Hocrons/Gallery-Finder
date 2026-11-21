@@ -19,7 +19,13 @@ jobs:
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
       - name: Compilar APK
-        run: chmod +x gradlew && ./gradlew assembleDebug --stacktrace
+        run: |
+          chmod +x gradlew
+          set -o pipefail
+          ./gradlew assembleDebug 2>&1 | tee build.log
+      - name: Mostrar erros de compilação
+        if: failure()
+        run: grep -E "^e: |error:|FAILURE|What went wrong" -A2 build.log | head -60 | while IFS= read -r l; do echo "::error::$l"; done
       - name: Renomear
         run: cp app/build/outputs/apk/debug/app-debug.apk GaleriaIA.apk
       - uses: actions/upload-artifact@v4
@@ -32,3 +38,4 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: Galeria IA - build ${{ github.run_number }}
           files: GaleriaIA.apk
+          body: ${{ github.event.head_commit.message }}

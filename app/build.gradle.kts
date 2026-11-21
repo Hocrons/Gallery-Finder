@@ -12,14 +12,33 @@ android {
         applicationId = "com.galeriaia.app"
         minSdk = 30 // Android 11+ (necessário para Lixeira e pedidos de edição do MediaStore)
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1"
+        // Número do build do GitHub Actions: cada versão nova tem número maior (usado pelo atualizador)
+        val run = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
+        versionCode = run
+        versionName = "build $run"
+
+        // Só a arquitetura do S25 (arm64): APK bem menor e atualizações mais rápidas
+        ndk { abiFilters += "arm64-v8a" }
+    }
+
+    // Chave fixa: todas as versões têm a mesma assinatura, então dá para atualizar
+    // sem desinstalar (e sem perder o índice das fotos).
+    signingConfigs {
+        create("galeria") {
+            storeFile = file("galeria.keystore")
+            storePassword = "galeriaia"
+            keyAlias = "galeria"
+            keyPassword = "galeriaia"
+        }
     }
 
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("galeria")
+        }
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("galeria")
         }
     }
     compileOptions {
@@ -31,6 +50,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -57,6 +77,9 @@ dependencies {
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
     // Tradução PT -> EN offline
     implementation("com.google.mlkit:translate:17.0.3")
+
+    // Indexação em segundo plano
+    implementation("androidx.work:work-runtime-ktx:2.10.0")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.9.0")

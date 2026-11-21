@@ -20,10 +20,10 @@ class ClipTokenizer(mergesLines: List<String>) {
     private val cache = HashMap<String, List<String>>()
 
     private val pattern = Regex(
-        """(?U)<\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+""",
+        """<\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+""",
         RegexOption.IGNORE_CASE
     )
-    private val whitespace = Regex("""(?U)\s+""")
+    private val whitespace = Regex("""\s+""")
 
     init {
         // bytes_to_unicode() do GPT-2/CLIP, preservando a ordem de inserção

@@ -74,6 +74,7 @@ fun HomeScreen(
     snackbar: @Composable () -> Unit,
     onRequestPermission: () -> Unit,
     onOpenSettings: () -> Unit,
+    onStartIndexing: () -> Unit,
 ) {
     Scaffold(
         topBar = { TopAppBar(title = { Text("Galeria IA") }) },
@@ -98,11 +99,14 @@ fun HomeScreen(
                     Box16 { CircularProgressIndicator() }
 
                 else -> {
+                    state.update?.let { UpdateCard(it, vm::downloadUpdate) }
                     if (state.permission == PermissionState.PARTIAL) PartialAccessCard(onOpenSettings)
-                    IndexCard(state, vm)
+                    IndexCard(state, vm, onStartIndexing)
                     SearchArea(state, vm)
+                    DuplicatesCard(state, vm)
                 }
             }
+            if (state.permission != PermissionState.UNKNOWN) VersionFooter(vm)
         }
     }
 }
@@ -174,7 +178,76 @@ private fun SetupCard(download: DownloadState?, onDownload: () -> Unit) {
 }
 
 @Composable
-private fun IndexCard(state: UiState, vm: MainViewModel) {
+private fun UpdateCard(update: UpdateUi, onUpdate: () -> Unit) {
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Nova versão disponível (build ${update.release.build})", style = MaterialTheme.typography.titleMedium)
+            if (update.release.notes.isNotBlank()) {
+                Text(update.release.notes.take(400), style = MaterialTheme.typography.bodySmall)
+            }
+            Text(
+                "Suas fotos analisadas e o modelo de IA são mantidos.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            update.error?.let { Text("Erro: $it", color = MaterialTheme.colorScheme.error) }
+            val p = update.progress
+            if (p != null) {
+                LinearProgressIndicator(progress = { p }, modifier = Modifier.fillMaxWidth())
+                Text("Baixando… ${(p * 100).toInt()}%", style = MaterialTheme.typography.bodySmall)
+            } else {
+                Button(onClick = onUpdate, modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        when {
+                            update.readyFile != null -> "Instalar"
+                            update.release.sizeBytes > 0 -> "Atualizar (${update.release.sizeBytes / 1_000_000} MB)"
+                            else -> "Atualizar"
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DuplicatesCard(state: UiState, vm: MainViewModel) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Fotos repetidas e parecidas", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Agrupa fotos idênticas ou quase iguais (rajadas, prints repetidos, fotos salvas duas vezes) " +
+                    "e já sugere qual manter em cada grupo.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Button(
+                onClick = vm::findDuplicates,
+                enabled = state.indexedImages > 0,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Procurar repetidas") }
+            if (state.dup != null && !state.dup.computing) {
+                TextButton(onClick = vm::openDuplicatesAgain) { Text("Ver resultado anterior") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun VersionFooter(vm: MainViewModel) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            "Versão: build ${com.galeriaia.app.update.Updater.currentBuild}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        TextButton(onClick = { vm.checkUpdate(manual = true) }) { Text("Verificar atualização") }
+    }
+}
+
+@Composable
+private fun IndexCard(state: UiState, vm: MainViewModel, onStartIndexing: () -> Unit) {
     val total = state.totalImages
     val indexed = state.indexedImages.coerceAtMost(total)
     val missing = total - indexed
@@ -192,21 +265,26 @@ private fun IndexCard(state: UiState, vm: MainViewModel) {
                     val elapsed = System.currentTimeMillis() - prog.startedAt
                     val eta = if (prog.done > 0) elapsed / prog.done * (prog.total - prog.done) / 1000 else -1
                     Text(
-                        "Analisando ${prog.done}/${prog.total}" + if (eta >= 0) " · ~${formatEta(eta)} restantes" else "",
+                        when {
+                            prog.total == 0 -> "Iniciando…"
+                            prog.coolingTemp != null -> "Pausado para esfriar (%.0f °C) · ${prog.done}/${prog.total}".format(prog.coolingTemp)
+                            else -> "Analisando ${prog.done}/${prog.total}" + if (eta >= 0) " · ~${formatEta(eta)} restantes" else ""
+                        },
                         style = MaterialTheme.typography.bodySmall,
                     )
                     Text(
-                        "Deixe o app aberto (a tela fica ligada). Se pausar, ele continua de onde parou.",
+                        "Roda em segundo plano: pode usar o celular ou apagar a tela. " +
+                            "Se a bateria esquentar, ele pausa sozinho até esfriar.",
                         style = MaterialTheme.typography.bodySmall,
                     )
                     OutlinedButton(onClick = vm::cancelIndexing) { Text("Pausar") }
                 }
                 missing > 0 -> {
-                    Button(onClick = vm::startIndexing, modifier = Modifier.fillMaxWidth()) {
+                    Button(onClick = onStartIndexing, modifier = Modifier.fillMaxWidth()) {
                         Text(if (indexed == 0) "Indexar galeria ($total fotos)" else "Indexar $missing fotos novas")
                     }
-                    if (indexed == 0) Text(
-                        "A primeira vez demora alguns minutos. Busca só por data funciona sem indexar.",
+                    Text(
+                        "Roda em segundo plano. Fotos novas também são analisadas sozinhas quando o celular está carregando.",
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }

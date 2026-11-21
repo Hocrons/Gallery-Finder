@@ -5,33 +5,36 @@ import android.content.IntentSender
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
 import com.galeriaia.app.data.Album
 import com.galeriaia.app.data.EmbeddingIndex
 import com.galeriaia.app.data.EmbeddingStore
 import com.galeriaia.app.data.MediaImage
 import com.galeriaia.app.data.MediaRepository
+import com.galeriaia.app.indexing.IndexWorker
 import com.galeriaia.app.ml.ClipModel
 import com.galeriaia.app.ml.ModelDownloader
 import com.galeriaia.app.ml.ModelFiles
 import com.galeriaia.app.ml.PtEnTranslator
 import com.galeriaia.app.search.DateFilter
+import com.galeriaia.app.search.DuplicateFinder
 import com.galeriaia.app.search.QueryParser
+import com.galeriaia.app.update.Updater
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import kotlin.math.sqrt
 
-enum class Screen { HOME, RESULTS }
+enum class Screen { HOME, RESULTS, DUPLICATES }
 
 data class Hit(val id: Long, val uri: Uri, val score: Float, val dateTaken: Long)
 
@@ -48,7 +51,29 @@ data class SearchResult(
 
 data class DownloadState(val done: Long, val total: Long, val file: String, val error: String? = null)
 
-data class IndexProgress(val done: Int, val total: Int, val startedAt: Long)
+data class IndexProgress(val done: Int, val total: Int, val startedAt: Long, val coolingTemp: Float? = null)
+
+data class UpdateUi(
+    val release: Updater.Release,
+    val progress: Float? = null,
+    val readyFile: File? = null,
+    val error: String? = null,
+)
+
+data class DupUi(
+    val computing: Boolean = true,
+    /** Cada grupo já vem ordenado: a primeira foto é a sugerida para manter. */
+    val groups: List<List<Hit>> = emptyList(),
+    val threshold: Float = DEFAULT_DUP_THRESHOLD,
+    val selected: Set<Long> = emptySet(),
+    val keep: Set<Long> = emptySet(),
+    val partialIndex: Boolean = false,
+) {
+    val selectedHits: List<Hit> get() = groups.flatten().filter { it.id in selected }
+}
+
+const val DEFAULT_DUP_THRESHOLD = 0.96f
+const val MIN_DUP_THRESHOLD = 0.93f
 
 sealed interface ActionKind {
     data object Trash : ActionKind
@@ -77,6 +102,9 @@ data class UiState(
     val pending: PendingRequest? = null,
     val busy: String? = null,
     val message: String? = null,
+    val update: UpdateUi? = null,
+    val installRequest: File? = null,
+    val dup: DupUi? = null,
 ) {
     val visibleHits: List<Hit>
         get() {
@@ -93,6 +121,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val media = MediaRepository(app)
     private val store = EmbeddingStore(app)
     private val translator = PtEnTranslator()
+    private val workManager = WorkManager.getInstance(app)
+    /** Só o modelo de texto é carregado aqui; o de imagem roda no IndexWorker. */
     private val clip by lazy { ClipModel(ModelFiles.dir(app.filesDir)) }
 
     private val _state = MutableStateFlow(UiState())
@@ -100,20 +130,31 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private var images: List<MediaImage> = emptyList()
     private var index: EmbeddingIndex? = null
-    private var indexJob: Job? = null
     private var downloadJob: Job? = null
     private var remainingChunks: ArrayDeque<List<Hit>> = ArrayDeque()
     private var actionDoneCount = 0
+    private var wasIndexing = false
+
+    // dados das duplicadas (pares calculados uma vez; reagrupados quando muda a régua)
+    private var dupIndex: EmbeddingIndex? = null
+    private var dupPairs: DuplicateFinder.Pairs? = null
+    private var dupDetails: Map<Long, MediaRepository.Detail> = emptyMap()
+    private val removedIds = HashSet<Long>()
 
     init {
         checkModels()
+        observeIndexing()
+        checkUpdate(manual = false)
     }
 
     // ---------- Permissão e modelos ----------
 
     fun onPermission(state: PermissionState) {
         _state.update { it.copy(permission = state) }
-        if (state == PermissionState.GRANTED || state == PermissionState.PARTIAL) refreshGallery()
+        if (state == PermissionState.GRANTED || state == PermissionState.PARTIAL) {
+            refreshGallery()
+            if (_state.value.modelsReady == true) IndexWorker.scheduleAuto(getApplication())
+        }
     }
 
     private fun checkModels() = viewModelScope.launch {
@@ -135,6 +176,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _state.update { it.copy(download = it.download?.copy(file = "tradutor PT→EN")) }
                 translator.download()
                 _state.update { it.copy(download = null, modelsReady = true) }
+                IndexWorker.scheduleAuto(getApplication())
             } catch (e: Exception) {
                 _state.update {
                     it.copy(download = it.download?.copy(error = e.message ?: e.javaClass.simpleName))
@@ -143,81 +185,73 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ---------- Galeria e indexação ----------
+    // ---------- Galeria e indexação (o trabalho pesado roda no IndexWorker) ----------
 
     fun refreshGallery() = viewModelScope.launch {
-        if (indexJob?.isActive == true) return@launch
         withContext(Dispatchers.IO) {
             images = media.queryImages()
             val current = images.mapTo(HashSet()) { it.id }
             val indexed = store.allIds()
-            val removed = indexed.filter { it !in current }
-            if (removed.isNotEmpty()) {
-                store.delete(removed)
-                index = null
-            }
-            val indexedNow = indexed.size - removed.size
+            val indexedNow = indexed.count { it in current }
             _state.update {
-                it.copy(totalImages = images.size, indexedImages = indexedNow, albums = media.albums(images))
+                val base = it.copy(totalImages = images.size, albums = media.albums(images))
+                if (it.indexProgress == null) base.copy(indexedImages = indexedNow) else base
+            }
+        }
+    }
+
+    private fun observeIndexing() = viewModelScope.launch {
+        workManager.getWorkInfosByTagFlow(IndexWorker.TAG).collect { infos ->
+            val running = infos.firstOrNull { it.state == WorkInfo.State.RUNNING }
+            val waitingManual = infos.any {
+                it.state == WorkInfo.State.ENQUEUED && it.tags.contains(IndexWorker.TAG_MANUAL)
+            }
+            when {
+                running != null -> {
+                    val p = running.progress
+                    val total = p.getInt(IndexWorker.KEY_TOTAL, 0)
+                    val done = p.getInt(IndexWorker.KEY_DONE, 0)
+                    val started = p.getLong(IndexWorker.KEY_STARTED, System.currentTimeMillis())
+                    val cooling = if (p.getBoolean(IndexWorker.KEY_COOLING, false)) p.getFloat(IndexWorker.KEY_TEMP, 0f) else null
+                    wasIndexing = true
+                    index = null
+                    _state.update {
+                        it.copy(
+                            indexProgress = IndexProgress(done, total, started, cooling),
+                            indexedImages = if (total > 0) (it.totalImages - (total - done)).coerceAtLeast(0) else it.indexedImages,
+                        )
+                    }
+                }
+                waitingManual -> _state.update {
+                    it.copy(indexProgress = IndexProgress(0, 0, System.currentTimeMillis()))
+                }
+                else -> {
+                    _state.update { it.copy(indexProgress = null) }
+                    if (wasIndexing) {
+                        wasIndexing = false
+                        index = null
+                        refreshGallery()
+                        _state.update { it.copy(message = "Indexação finalizada ✔") }
+                    }
+                }
             }
         }
     }
 
     fun startIndexing() {
-        if (indexJob?.isActive == true || _state.value.modelsReady != true) return
-        indexJob = viewModelScope.launch(Dispatchers.Default) {
-            val indexed = withContext(Dispatchers.IO) { store.allIds() }
-            val todo = images.filter { it.id !in indexed }
-            if (todo.isEmpty()) {
-                _state.update { it.copy(message = "Tudo indexado ✔") }
-                return@launch
-            }
-            val started = System.currentTimeMillis()
-            _state.update { it.copy(indexProgress = IndexProgress(0, todo.size, started)) }
-            var done = 0
-            try {
-                for (chunk in todo.chunked(16)) {
-                    ensureActive()
-                    // Decodifica as miniaturas em paralelo; a IA roda uma por vez.
-                    val prepared = chunk.map { img ->
-                        async(Dispatchers.IO) {
-                            runCatching {
-                                val bmp = media.loadThumbnail(img.uri)
-                                try { clip.preprocess(bmp) } finally { bmp.recycle() }
-                            }.getOrNull()
-                        }
-                    }.awaitAll()
-                    val entries = chunk.mapIndexed { i, img ->
-                        // Se a foto não abrir (corrompida etc.), salva vetor zerado para não tentar de novo.
-                        val vec = prepared[i]?.let { runCatching { clip.embedImage(it) }.getOrNull() }
-                            ?: FloatArray(ClipModel.EMBED_DIM)
-                        EmbeddingStore.Entry(img.id, img.dateTaken, vec)
-                    }
-                    withContext(Dispatchers.IO) { store.insert(entries) }
-                    done += chunk.size
-                    _state.update {
-                        it.copy(
-                            indexProgress = IndexProgress(done, todo.size, started),
-                            indexedImages = indexed.size + done,
-                        )
-                    }
-                }
-                _state.update { it.copy(message = "Indexação concluída: $done fotos") }
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                _state.update { it.copy(message = "Indexação pausada ($done salvas). Continue quando quiser.") }
-                throw e
-            } catch (e: Throwable) {
-                _state.update { it.copy(message = "Erro na indexação: ${e.message}") }
-            } finally {
-                index = null
-                _state.update { it.copy(indexProgress = null) }
-            }
-        }
+        if (_state.value.modelsReady != true) return
+        IndexWorker.startNow(getApplication())
     }
 
     fun cancelIndexing() {
-        indexJob?.cancel()
+        IndexWorker.cancel(getApplication())
+        _state.update { it.copy(message = "Indexação pausada. Continue quando quiser.") }
     }
+
+    private suspend fun loadIndex(): EmbeddingIndex =
+        index ?: withContext(Dispatchers.IO) { store.loadIndex() }.also {
+            if (_state.value.indexProgress == null) index = it
+        }
 
     // ---------- Busca ----------
 
@@ -258,8 +292,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 } else {
                     val ptText = applyGlossary(parsed.text)
                     val english = runCatching { translator.translate(ptText) }.getOrDefault(ptText)
+                    val idx = loadIndex()
                     val hits = withContext(Dispatchers.Default) {
-                        val idx = index ?: withContext(Dispatchers.IO) { store.loadIndex() }.also { index = it }
                         val q = textQuery(english)
                         val scores = idx.scores(q)
                         val list = ArrayList<Hit>()
@@ -321,16 +355,81 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun clearMessage() = _state.update { it.copy(message = null) }
 
+    // ---------- Duplicadas e parecidas ----------
+
+    fun findDuplicates() {
+        _state.update { it.copy(screen = Screen.DUPLICATES, dup = DupUi(computing = true)) }
+        viewModelScope.launch {
+            try {
+                val idx = loadIndex()
+                val pairs = withContext(Dispatchers.Default) {
+                    DuplicateFinder(ClipModel.EMBED_DIM).findPairs(idx.vectors, idx.size, MIN_DUP_THRESHOLD)
+                }
+                val involved = HashSet<Long>()
+                for (p in 0 until pairs.size) { involved += idx.ids[pairs.a[p]]; involved += idx.ids[pairs.b[p]] }
+                dupDetails = withContext(Dispatchers.IO) { media.details(involved) }
+                dupIndex = idx
+                dupPairs = pairs
+                removedIds.clear()
+                regroup(DEFAULT_DUP_THRESHOLD)
+            } catch (e: Throwable) {
+                _state.update { it.copy(screen = Screen.HOME, dup = null, message = "Erro ao procurar duplicadas: ${e.message}") }
+            }
+        }
+    }
+
+    fun setDupThreshold(t: Float) {
+        viewModelScope.launch { regroup(t) }
+    }
+
+    private suspend fun regroup(threshold: Float) {
+        val idx = dupIndex ?: return
+        val pairs = dupPairs ?: return
+        val groups = withContext(Dispatchers.Default) {
+            DuplicateFinder.groups(pairs, idx.size, threshold).mapNotNull { g ->
+                val hits = g.map { i -> Hit(idx.ids[i], media.uriFor(idx.ids[i]), 1f, idx.dates[i]) }
+                    .filter { it.id !in removedIds }
+                    // melhor primeiro: maior resolução, depois maior arquivo, depois a mais antiga (original)
+                    .sortedWith(
+                        compareByDescending<Hit> { dupDetails[it.id]?.pixels ?: 0L }
+                            .thenByDescending { dupDetails[it.id]?.bytes ?: 0L }
+                            .thenBy { it.dateTaken }
+                    )
+                hits.takeIf { it.size >= 2 }
+            }
+        }
+        _state.update {
+            it.copy(
+                dup = DupUi(
+                    computing = false,
+                    groups = groups,
+                    threshold = threshold,
+                    keep = groups.mapTo(HashSet()) { g -> g.first().id },
+                    selected = groups.flatMap { g -> g.drop(1) }.mapTo(HashSet()) { h -> h.id },
+                    partialIndex = it.indexedImages < it.totalImages,
+                )
+            )
+        }
+    }
+
+    fun toggleDup(id: Long) = _state.update { st ->
+        val d = st.dup ?: return@update st
+        st.copy(dup = d.copy(selected = if (id in d.selected) d.selected - id else d.selected + id))
+    }
+
+    fun openDuplicatesAgain() = _state.update { it.copy(screen = Screen.DUPLICATES) }
+
+    fun trashDuplicates() = startAction(ActionKind.Trash, _state.value.dup?.selectedHits.orEmpty())
+
     // ---------- Ações: Lixeira e mover ----------
 
-    fun trashSelected() = startAction(ActionKind.Trash)
+    fun trashSelected() = startAction(ActionKind.Trash, _state.value.selectedHits)
 
-    fun moveSelected(relativePath: String) = startAction(ActionKind.Move(relativePath))
+    fun moveSelected(relativePath: String) = startAction(ActionKind.Move(relativePath), _state.value.selectedHits)
 
-    private fun startAction(kind: ActionKind) {
-        val sel = _state.value.selectedHits
-        if (sel.isEmpty()) return
-        remainingChunks = ArrayDeque(sel.chunked(CHUNK))
+    private fun startAction(kind: ActionKind, hits: List<Hit>) {
+        if (hits.isEmpty()) return
+        remainingChunks = ArrayDeque(hits.chunked(CHUNK))
         actionDoneCount = 0
         nextChunk(kind)
     }
@@ -369,7 +468,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     val ids = req.chunk.map { it.id }
                     withContext(Dispatchers.IO) { store.delete(ids) }
                     actionDoneCount += ids.size
-                    removeFromResults(ids.toSet())
+                    removeIds(ids.toSet())
                 }
                 is ActionKind.Move -> {
                     _state.update { it.copy(busy = "Movendo fotos…") }
@@ -393,13 +492,51 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         refreshGallery()
     }
 
-    private fun removeFromResults(ids: Set<Long>) {
+    private suspend fun removeIds(ids: Set<Long>) {
         index = null
+        removedIds += ids
         _state.update { st ->
-            val r = st.result ?: return@update st
-            st.copy(result = r.copy(hits = r.hits.filter { it.id !in ids }), excluded = st.excluded - ids)
+            val r = st.result
+            st.copy(
+                result = r?.copy(hits = r.hits.filter { it.id !in ids }),
+                excluded = st.excluded - ids,
+            )
+        }
+        if (_state.value.dup != null) regroup(_state.value.dup!!.threshold)
+    }
+
+    // ---------- Atualização do app ----------
+
+    fun checkUpdate(manual: Boolean) = viewModelScope.launch {
+        val release = withContext(Dispatchers.IO) { runCatching { Updater.checkLatest() } }
+        release.onSuccess { rel ->
+            if (rel != null) _state.update { it.copy(update = UpdateUi(rel)) }
+            else if (manual) _state.update { it.copy(message = "Você já está na versão mais recente (build ${Updater.currentBuild}).") }
+        }.onFailure { e ->
+            if (manual) _state.update { it.copy(message = "Não consegui verificar: ${e.message}") }
         }
     }
+
+    fun downloadUpdate() {
+        val u = _state.value.update ?: return
+        u.readyFile?.let { f -> _state.update { it.copy(installRequest = f) }; return }
+        if (u.progress != null) return
+        _state.update { it.copy(update = u.copy(progress = 0f, error = null)) }
+        viewModelScope.launch {
+            try {
+                val file = withContext(Dispatchers.IO) {
+                    Updater.download(getApplication(), u.release) { p ->
+                        _state.update { st -> st.copy(update = st.update?.copy(progress = p)) }
+                    }
+                }
+                _state.update { it.copy(update = it.update?.copy(progress = null, readyFile = file), installRequest = file) }
+            } catch (e: Throwable) {
+                _state.update { it.copy(update = it.update?.copy(progress = null, error = e.message)) }
+            }
+        }
+    }
+
+    fun installHandled() = _state.update { it.copy(installRequest = null) }
 
     override fun onCleared() {
         translator.close()
