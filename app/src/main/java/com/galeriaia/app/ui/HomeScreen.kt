@@ -39,6 +39,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SuggestionChip
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -259,6 +260,19 @@ private fun IndexCard(state: UiState, vm: MainViewModel, onStartIndexing: () -> 
                 progress = { if (total == 0) 0f else indexed.toFloat() / total },
                 modifier = Modifier.fillMaxWidth(),
             )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Modo rápido", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        if (state.fastMode) "Usa mais o processador e não pausa por temperatura. O celular esquenta mais."
+                        else "Desligado: mais lento, mas pausa sozinho se esquentar.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+                Switch(checked = state.fastMode, onCheckedChange = vm::setFastMode)
+            }
             val prog = state.indexProgress
             when {
                 prog != null -> {
@@ -273,8 +287,8 @@ private fun IndexCard(state: UiState, vm: MainViewModel, onStartIndexing: () -> 
                         style = MaterialTheme.typography.bodySmall,
                     )
                     Text(
-                        "Roda em segundo plano: pode usar o celular ou apagar a tela. " +
-                            "Se a bateria esquentar, ele pausa sozinho até esfriar.",
+                        "Roda em segundo plano: pode usar o celular ou apagar a tela." +
+                            if (state.fastMode) "" else " Se a bateria esquentar, ele pausa sozinho até esfriar.",
                         style = MaterialTheme.typography.bodySmall,
                     )
                     OutlinedButton(onClick = vm::cancelIndexing) { Text("Pausar") }

@@ -12,6 +12,7 @@ import com.galeriaia.app.data.EmbeddingIndex
 import com.galeriaia.app.data.EmbeddingStore
 import com.galeriaia.app.data.MediaImage
 import com.galeriaia.app.data.MediaRepository
+import com.galeriaia.app.data.Prefs
 import com.galeriaia.app.indexing.IndexWorker
 import com.galeriaia.app.ml.ClipModel
 import com.galeriaia.app.ml.ModelDownloader
@@ -105,6 +106,7 @@ data class UiState(
     val update: UpdateUi? = null,
     val installRequest: File? = null,
     val dup: DupUi? = null,
+    val fastMode: Boolean = false,
 ) {
     val visibleHits: List<Hit>
         get() {
@@ -142,6 +144,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val removedIds = HashSet<Long>()
 
     init {
+        _state.update { it.copy(fastMode = Prefs.fastMode(app)) }
         checkModels()
         observeIndexing()
         checkUpdate(manual = false)
@@ -241,6 +244,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun startIndexing() {
         if (_state.value.modelsReady != true) return
         IndexWorker.startNow(getApplication())
+    }
+
+    fun setFastMode(on: Boolean) {
+        Prefs.setFastMode(getApplication(), on)
+        _state.update { it.copy(fastMode = on) }
+        // Se estiver indexando, reinicia já no novo modo (continua de onde parou)
+        if (_state.value.indexProgress != null) IndexWorker.restart(getApplication())
     }
 
     fun cancelIndexing() {

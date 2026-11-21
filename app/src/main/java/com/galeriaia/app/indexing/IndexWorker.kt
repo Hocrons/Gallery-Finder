@@ -22,6 +22,7 @@ import androidx.work.workDataOf
 import com.galeriaia.app.MainActivity
 import com.galeriaia.app.data.EmbeddingStore
 import com.galeriaia.app.data.MediaRepository
+import com.galeriaia.app.data.Prefs
 import com.galeriaia.app.ml.ClipModel
 import com.galeriaia.app.ml.ModelFiles
 import kotlinx.coroutines.Dispatchers
@@ -53,7 +54,8 @@ class IndexWorker(context: Context, params: WorkerParameters) : CoroutineWorker(
 
         private const val CHANNEL = "indexacao"
         private const val NOTIF_ID = 1001
-        private const val THREADS = 3 // menos núcleos = esquenta menos (um pouco mais lento)
+        private const val THREADS_NORMAL = 3 // menos núcleos = esquenta menos
+        private const val THREADS_FAST = 6
         private const val HOT_C = 41f
         private const val COOL_C = 37f
 
@@ -63,6 +65,14 @@ class IndexWorker(context: Context, params: WorkerParameters) : CoroutineWorker(
         fun startNow(ctx: Context) {
             WorkManager.getInstance(ctx).enqueueUniqueWork(
                 UNIQUE_MANUAL, ExistingWorkPolicy.KEEP,
+                OneTimeWorkRequestBuilder<IndexWorker>().addTag(TAG).addTag(TAG_MANUAL).build()
+            )
+        }
+
+        /** Reinicia a indexação em andamento (ex.: ao trocar o modo rápido). Continua de onde parou. */
+        fun restart(ctx: Context) {
+            WorkManager.getInstance(ctx).enqueueUniqueWork(
+                UNIQUE_MANUAL, ExistingWorkPolicy.REPLACE,
                 OneTimeWorkRequestBuilder<IndexWorker>().addTag(TAG).addTag(TAG_MANUAL).build()
             )
         }
@@ -89,12 +99,8 @@ class IndexWorker(context: Context, params: WorkerParameters) : CoroutineWorker(
     override suspend fun doWork(): Result {
         val ctx = applicationContext
         if (!ModelFiles.allPresent(ctx.filesDir)) return Result.failure()
-        if (!lock.tryLock()) return Result.success()
-        try {
-            return indexAll(ctx)
-        } finally {
-            lock.unlock()
-        }
+        // Se outra indexação estiver terminando, espera ela liberar
+        return lock.withLock { indexAll(ctx) }
     }
 
     private suspend fun indexAll(ctx: Context): Result {
@@ -109,14 +115,15 @@ class IndexWorker(context: Context, params: WorkerParameters) : CoroutineWorker(
         val todo = images.filter { it.id !in indexed }
         if (todo.isEmpty()) return Result.success()
 
-        runCatching { setForeground(foregroundInfo("Analisando fotos…", 0, todo.size)) }
+        runCatching { setForeground(foregroundInfo(if (Prefs.fastMode(ctx)) "Analisando (modo rápido)…" else "Analisando fotos…", 0, todo.size)) }
         val started = System.currentTimeMillis()
         var done = 0
+        val fast = Prefs.fastMode(ctx)
 
-        ClipModel(ModelFiles.dir(ctx.filesDir), THREADS).use { clip ->
+        ClipModel(ModelFiles.dir(ctx.filesDir), if (fast) THREADS_FAST else THREADS_NORMAL).use { clip ->
             for (chunk in todo.chunked(16)) {
                 if (isStopped) break
-                coolDownIfHot(ctx, done, todo.size, started)
+                if (!fast) coolDownIfHot(ctx, done, todo.size, started)
 
                 val entries = coroutineScope {
                     val prepared = chunk.map { img ->
