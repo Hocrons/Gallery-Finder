@@ -41,6 +41,9 @@ data class Hit(val id: Long, val uri: Uri, val score: Float, val dateTaken: Long
 
 enum class SearchMode { TEXT, IMAGE, DATE }
 
+/** Foto do que NÃO se quer. Se veio da galeria indexada, [id] permite usar o vetor já salvo. */
+data class NegativeExample(val uri: Uri, val id: Long? = null)
+
 data class SearchResult(
     val originalQuery: String,
     /** Texto que foi para a IA (já em inglês). */
@@ -55,6 +58,9 @@ data class SearchResult(
     val pendingInRange: Int = 0,
     val pendingFilter: DateFilter? = null,
     val exampleUri: Uri? = null,
+    val negatives: List<NegativeExample> = emptyList(),
+    /** Quantas fotos foram descartadas por parecerem com as fotos "não quero". */
+    val ignoredCount: Int = 0,
 ) {
     val semantic: Boolean get() = mode != SearchMode.DATE
     /** Foto x foto dá notas bem mais altas que texto x foto, então a régua muda. */
@@ -130,6 +136,8 @@ data class UiState(
     val indexedUntil: Long? = null,
     /** Foto de exemplo escolhida para a busca. */
     val exampleUri: Uri? = null,
+    /** Fotos do que NÃO quero (até 5). */
+    val negatives: List<NegativeExample> = emptyList(),
 ) {
     val visibleHits: List<Hit>
         get() {
@@ -307,7 +315,41 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setExample(uri: Uri?) = _state.update { it.copy(exampleUri = uri) }
 
+    fun addNegative(uri: Uri) = _state.update {
+        if (it.negatives.size >= MAX_NEGATIVES || it.negatives.any { n -> n.uri == uri }) it
+        else it.copy(negatives = it.negatives + NegativeExample(uri))
+    }
+
+    fun removeNegative(n: NegativeExample) = _state.update { it.copy(negatives = it.negatives - n) }
+
+    /** Nos resultados: "não quero fotos como esta" → refaz a busca na hora. */
+    fun ignoreSimilarTo(hit: Hit) {
+        val st = _state.value
+        if (st.negatives.size >= MAX_NEGATIVES) {
+            _state.update { it.copy(message = "Máximo de $MAX_NEGATIVES fotos para ignorar. Remova alguma.") }
+            return
+        }
+        if (st.negatives.none { it.id == hit.id }) {
+            _state.update { it.copy(negatives = it.negatives + NegativeExample(hit.uri, hit.id)) }
+        }
+        rerunLastSearch()
+    }
+
+    fun clearNegativesAndRerun() {
+        _state.update { it.copy(negatives = emptyList()) }
+        rerunLastSearch()
+    }
+
+    /** Última busca feita, para poder refazer com os filtros novos. */
+    private var lastSimilarTo: Hit? = null
+
+    private fun rerunLastSearch() {
+        val similar = lastSimilarTo
+        if (similar != null) searchSimilarTo(similar) else search()
+    }
+
     fun search() {
+        lastSimilarTo = null
         val s = _state.value
         if (s.searching) return
         val parsed = QueryParser.parse(s.query)
@@ -330,12 +372,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     parsed.text.isBlank() -> {
                         // Só data: não precisa de IA, usa a galeria inteira.
-                        val hits = images.asSequence()
+                        var hits = images.asSequence()
                             .filter { dateFilter!!.matches(toDate(it.dateTaken)) }
                             .sortedByDescending { it.dateTaken }
                             .map { Hit(it.id, it.uri, 1f, it.dateTaken) }
                             .toList()
-                        SearchResult(s.query, "", dateFilter?.label, SearchMode.DATE, hits, 0f)
+                        var ignored = 0
+                        if (s.negatives.isNotEmpty()) {
+                            val idx = loadIndex()
+                            val negMax = negativeScores(idx, s.negatives)
+                            val pos = HashMap<Long, Int>(idx.size * 2).apply { idx.ids.forEachIndexed { i, id -> put(id, i) } }
+                            val before = hits.size
+                            hits = hits.filter { h -> pos[h.id]?.let { negMax[it] < NEG_ABSOLUTE } ?: true }
+                            ignored = before - hits.size
+                        }
+                        SearchResult(
+                            s.query, "", dateFilter?.label, SearchMode.DATE, hits, 0f,
+                            negatives = s.negatives, ignoredCount = ignored,
+                        )
                     }
                     else -> {
                         val ptText = applyGlossary(parsed.text)
@@ -353,6 +407,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** "Parecidas com esta": usa o vetor que a foto já tem no índice (instantâneo). */
     fun searchSimilarTo(hit: Hit) {
+        lastSimilarTo = hit
         if (_state.value.searching) return
         _state.update { it.copy(searching = true) }
         viewModelScope.launch {
@@ -392,12 +447,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     ): SearchResult {
         val idx = loadIndex()
         val minScore = if (mode == SearchMode.IMAGE) MIN_SCORE_IMAGE else MIN_SCORE
+        val negatives = _state.value.negatives
+        val negMax = if (negatives.isEmpty()) null else negativeScores(idx, negatives)
+        var ignored = 0
         val hits = withContext(Dispatchers.Default) {
             val scores = idx.scores(q)
             val list = ArrayList<Hit>()
             for (i in 0 until idx.size) {
                 if (scores[i] < minScore) continue
                 if (dateFilter != null && !dateFilter.matches(toDate(idx.dates[i]))) continue
+                if (negMax != null) {
+                    // Foto x foto: descarta se parece mais com o "não quero" do que com o exemplo.
+                    // Texto x foto (escalas diferentes): descarta se for bem parecida com o "não quero".
+                    val drop = if (mode == SearchMode.IMAGE) negMax[i] >= scores[i] else negMax[i] >= NEG_ABSOLUTE
+                    if (drop) { ignored++; continue }
+                }
                 list += Hit(idx.ids[i], media.uriFor(idx.ids[i]), scores[i], idx.dates[i])
             }
             list.sortByDescending { it.score }
@@ -426,8 +490,28 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             pendingInRange = pending,
             pendingFilter = dateFilter.takeIf { pending > 0 },
             exampleUri = exampleUri,
+            negatives = negatives,
+            ignoredCount = ignored,
         )
     }
+
+    /** Para cada foto do índice, a maior semelhança com qualquer uma das fotos "não quero". */
+    private suspend fun negativeScores(idx: EmbeddingIndex, negatives: List<NegativeExample>): FloatArray =
+        withContext(Dispatchers.Default) {
+            val d = ClipModel.EMBED_DIM
+            val best = FloatArray(idx.size) { -1f }
+            for (n in negatives) {
+                val pos = n.id?.let { idx.ids.indexOf(it) } ?: -1
+                val vec = if (pos >= 0) idx.vectors.copyOfRange(pos * d, (pos + 1) * d)
+                else {
+                    val bmp = withContext(Dispatchers.IO) { media.decodeSampled(n.uri) }
+                    try { clip.embedImage(clip.preprocess(bmp)) } finally { bmp.recycle() }
+                }
+                val sc = idx.scores(vec)
+                for (i in sc.indices) if (sc[i] > best[i]) best[i] = sc[i]
+            }
+            best
+        }
 
     fun coverageText(st: UiState): String {
         val pct = if (st.totalImages == 0) 0 else st.indexedImages * 100 / st.totalImages
@@ -675,6 +759,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         private const val CHUNK = 500
         private const val MIN_SCORE = 0.15f
         private const val MIN_SCORE_IMAGE = 0.55f
+        private const val MAX_NEGATIVES = 5
+        /** Semelhança foto x foto a partir da qual consideramos "é o tipo de foto que não quero". */
+        private const val NEG_ABSOLUTE = 0.82f
         private val MONTHS = listOf("jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez")
         private val GLOSSARY = listOf(
             Regex("(?i)\\bprints\\b") to "capturas de tela",

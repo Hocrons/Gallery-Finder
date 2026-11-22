@@ -5,6 +5,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -135,7 +137,7 @@ fun ResultsScreen(state: UiState, vm: MainViewModel, snackbar: @Composable () ->
         snackbarHost = snackbar,
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
-            SearchInfo(result, vm::prioritize)
+            SearchInfo(result, vm::prioritize, vm::clearNegativesAndRerun)
 
             if (result.semantic) {
                 Column(Modifier.padding(horizontal = 16.dp)) {
@@ -161,7 +163,7 @@ fun ResultsScreen(state: UiState, vm: MainViewModel, snackbar: @Composable () ->
                 }
             } else {
                 Text(
-                    "Toque para marcar/desmarcar · segure para ver a foto",
+                    "Toque para marcar/desmarcar · segure para ver, buscar parecidas ou ignorar",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
@@ -190,6 +192,7 @@ fun ResultsScreen(state: UiState, vm: MainViewModel, snackbar: @Composable () ->
             selected = hit.id !in state.excluded,
             onToggle = { vm.toggle(hit.id) },
             onFindSimilar = { vm.searchSimilarTo(hit) },
+            onIgnoreSimilar = { vm.ignoreSimilarTo(hit) },
         ) { preview = null }
     }
 
@@ -207,7 +210,11 @@ fun ResultsScreen(state: UiState, vm: MainViewModel, snackbar: @Composable () ->
 }
 
 @Composable
-private fun SearchInfo(result: SearchResult, onPrioritize: (com.galeriaia.app.search.DateFilter) -> Unit) {
+private fun SearchInfo(
+    result: SearchResult,
+    onPrioritize: (com.galeriaia.app.search.DateFilter) -> Unit,
+    onClearNegatives: () -> Unit,
+) {
     Column(
         Modifier
             .fillMaxWidth()
@@ -232,6 +239,28 @@ private fun SearchInfo(result: SearchResult, onPrioritize: (com.galeriaia.app.se
             Text("IA buscou: \"${result.englishText}\"", style = MaterialTheme.typography.bodyMedium)
         }
         result.dateLabel?.let { Text("Período: $it", style = MaterialTheme.typography.bodyMedium) }
+        if (result.negatives.isNotEmpty()) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 6.dp)) {
+                Text("Ignorando:", style = MaterialTheme.typography.bodySmall)
+                Spacer(Modifier.width(6.dp))
+                result.negatives.forEach { n ->
+                    AsyncImage(
+                        model = n.uri,
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.padding(end = 4.dp).size(32.dp).clip(RoundedCornerShape(6.dp))
+                            .border(2.dp, MaterialTheme.colorScheme.error, RoundedCornerShape(6.dp)),
+                    )
+                }
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onClearNegatives) { Text("Limpar") }
+            }
+            Text(
+                "${result.ignoredCount} foto(s) descartadas por parecerem com essas.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         result.coverage?.let { cov ->
             Row(verticalAlignment = Alignment.Top, modifier = Modifier.padding(top = 6.dp)) {
                 Icon(Icons.Default.Info, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.error)
@@ -301,6 +330,7 @@ internal fun PreviewDialog(
     selected: Boolean,
     onToggle: () -> Unit,
     onFindSimilar: (() -> Unit)? = null,
+    onIgnoreSimilar: (() -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
@@ -310,19 +340,22 @@ internal fun PreviewDialog(
                     model = hit.uri,
                     contentDescription = null,
                     contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxWidth().heightIn(max = 560.dp).clickable(onClick = onDismiss),
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 520.dp).clickable(onClick = onDismiss),
+                )
+                Text(
+                    Instant.ofEpochMilli(hit.dateTaken).atZone(ZoneId.systemDefault()).format(DATE_FMT),
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(start = 16.dp, top = 10.dp),
                 )
                 Row(
-                    Modifier.fillMaxWidth().padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.End,
                 ) {
-                    Text(
-                        Instant.ofEpochMilli(hit.dateTaken).atZone(ZoneId.systemDefault()).format(DATE_FMT),
-                        modifier = Modifier.weight(1f),
-                    )
                     if (onFindSimilar != null) TextButton(onClick = { onDismiss(); onFindSimilar() }) { Text("Parecidas") }
+                    if (onIgnoreSimilar != null) TextButton(onClick = { onDismiss(); onIgnoreSimilar() }) {
+                        Text("Não quero estas", color = MaterialTheme.colorScheme.error)
+                    }
                     TextButton(onClick = onToggle) { Text(if (selected) "Desmarcar" else "Marcar") }
-                    TextButton(onClick = onDismiss) { Text("Fechar") }
                 }
             }
         }

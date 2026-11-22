@@ -8,6 +8,12 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import coil.compose.AsyncImage
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.graphics.Color
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -339,6 +345,9 @@ private fun SearchArea(state: UiState, vm: MainViewModel) {
     val photoPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null) vm.setExample(uri)
     }
+    val negativePicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) vm.addNegative(uri)
+    }
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         OutlinedTextField(
@@ -378,14 +387,56 @@ private fun SearchArea(state: UiState, vm: MainViewModel) {
                 }
                 IconButton(onClick = { vm.setExample(null) }) { Icon(Icons.Default.Close, "Remover foto") }
             }
-        } else {
-            AssistChip(
-                onClick = {
-                    photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-                },
-                label = { Text("Usar foto de exemplo") },
-                leadingIcon = { Icon(Icons.Default.Add, null, Modifier.size(18.dp)) },
+        }
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (state.exampleUri == null) item {
+                AssistChip(
+                    onClick = {
+                        photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                    },
+                    label = { Text("Usar foto de exemplo") },
+                    leadingIcon = { Icon(Icons.Default.Add, null, Modifier.size(18.dp)) },
+                )
+            }
+            if (state.negatives.size < 5) item {
+                AssistChip(
+                    onClick = {
+                        negativePicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                    },
+                    label = { Text("Foto do que NÃO quero") },
+                    leadingIcon = { Icon(Icons.Default.Close, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.error) },
+                )
+            }
+        }
+
+        // Fotos do que não quero
+        if (state.negatives.isNotEmpty()) {
+            Text(
+                "A IA vai descartar fotos parecidas com estas:",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(state.negatives) { n ->
+                    Box(Modifier.size(64.dp)) {
+                        AsyncImage(
+                            model = n.uri,
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(10.dp))
+                                .border(2.dp, MaterialTheme.colorScheme.error, RoundedCornerShape(10.dp)),
+                        )
+                        Icon(
+                            Icons.Default.Close,
+                            contentDescription = "Remover",
+                            tint = Color.White,
+                            modifier = Modifier.align(Alignment.TopEnd).padding(2.dp).size(20.dp)
+                                .background(Color.Black.copy(alpha = 0.6f), CircleShape)
+                                .clickable { vm.removeNegative(n) },
+                        )
+                    }
+                }
+            }
         }
 
         Row(verticalAlignment = Alignment.CenterVertically) {
