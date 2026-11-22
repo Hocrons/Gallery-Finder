@@ -89,6 +89,18 @@ class MediaRepository(context: Context) {
         return out
     }
 
+    /** Abre qualquer foto (inclusive do seletor de fotos) já reduzida, para a IA. */
+    fun decodeSampled(uri: Uri, maxSide: Int = 448): Bitmap {
+        val src = android.graphics.ImageDecoder.createSource(resolver, uri)
+        return android.graphics.ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
+            val w = info.size.width
+            val h = info.size.height
+            val scale = maxSide.toFloat() / maxOf(w, h)
+            if (scale < 1f) decoder.setTargetSize(maxOf(1, (w * scale).toInt()), maxOf(1, (h * scale).toInt()))
+            decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
+        }
+    }
+
     fun loadThumbnail(uri: Uri, size: Int = 320): Bitmap =
         resolver.loadThumbnail(uri, Size(size, size), null)
 

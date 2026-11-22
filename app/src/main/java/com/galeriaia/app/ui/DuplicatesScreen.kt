@@ -130,7 +130,7 @@ fun DuplicatesScreen(state: UiState, vm: MainViewModel, snackbar: @Composable ()
                         Icon(Icons.Default.Info, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.error)
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            "Galeria ainda não toda indexada: resultados parciais.",
+                            "Resultados parciais. ${dup.coverage ?: ""}",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.error,
                         )

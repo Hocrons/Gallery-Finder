@@ -89,6 +89,12 @@ class EmbeddingStore(context: Context) :
         }
     }
 
+    /** Data da foto mais antiga já analisada (a análise vai das mais novas para as mais antigas). */
+    fun oldestDate(): Long? =
+        readableDatabase.rawQuery("SELECT MIN(date_taken) FROM images WHERE date_taken > 0", null).use { c ->
+            if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null
+        }
+
     fun clear() {
         writableDatabase.execSQL("DELETE FROM images")
     }

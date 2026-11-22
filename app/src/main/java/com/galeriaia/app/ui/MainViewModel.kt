@@ -39,20 +39,38 @@ enum class Screen { HOME, RESULTS, DUPLICATES }
 
 data class Hit(val id: Long, val uri: Uri, val score: Float, val dateTaken: Long)
 
+enum class SearchMode { TEXT, IMAGE, DATE }
+
 data class SearchResult(
     val originalQuery: String,
-    /** Texto que foi para a IA (já em inglês). Vazio = busca só por data. */
+    /** Texto que foi para a IA (já em inglês). */
     val englishText: String,
     val dateLabel: String?,
-    val semantic: Boolean,
+    val mode: SearchMode,
     val hits: List<Hit>,
     val suggestedThreshold: Float,
-    val partialIndex: Boolean,
-)
+    /** Quanto da galeria a busca cobriu; null = tudo analisado. */
+    val coverage: String? = null,
+    /** Fotos do período buscado que a IA ainda não analisou. */
+    val pendingInRange: Int = 0,
+    val pendingFilter: DateFilter? = null,
+    val exampleUri: Uri? = null,
+) {
+    val semantic: Boolean get() = mode != SearchMode.DATE
+    /** Foto x foto dá notas bem mais altas que texto x foto, então a régua muda. */
+    val sliderRange: ClosedFloatingPointRange<Float>
+        get() = if (mode == SearchMode.IMAGE) 0.55f..0.98f else 0.15f..0.35f
+}
 
 data class DownloadState(val done: Long, val total: Long, val file: String, val error: String? = null)
 
-data class IndexProgress(val done: Int, val total: Int, val startedAt: Long, val coolingTemp: Float? = null)
+data class IndexProgress(
+    val done: Int,
+    val total: Int,
+    val startedAt: Long,
+    val coolingTemp: Float? = null,
+    val priorityLabel: String? = null,
+)
 
 data class UpdateUi(
     val release: Updater.Release,
@@ -69,6 +87,7 @@ data class DupUi(
     val selected: Set<Long> = emptySet(),
     val keep: Set<Long> = emptySet(),
     val partialIndex: Boolean = false,
+    val coverage: String? = null,
 ) {
     val selectedHits: List<Hit> get() = groups.flatten().filter { it.id in selected }
 }
@@ -107,6 +126,10 @@ data class UiState(
     val installRequest: File? = null,
     val dup: DupUi? = null,
     val fastMode: Boolean = false,
+    /** Data da foto mais antiga já analisada. */
+    val indexedUntil: Long? = null,
+    /** Foto de exemplo escolhida para a busca. */
+    val exampleUri: Uri? = null,
 ) {
     val visibleHits: List<Hit>
         get() {
@@ -196,8 +219,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val current = images.mapTo(HashSet()) { it.id }
             val indexed = store.allIds()
             val indexedNow = indexed.count { it in current }
+            val until = store.oldestDate()
             _state.update {
-                val base = it.copy(totalImages = images.size, albums = media.albums(images))
+                val base = it.copy(totalImages = images.size, albums = media.albums(images), indexedUntil = until)
                 if (it.indexProgress == null) base.copy(indexedImages = indexedNow) else base
             }
         }
@@ -216,11 +240,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     val done = p.getInt(IndexWorker.KEY_DONE, 0)
                     val started = p.getLong(IndexWorker.KEY_STARTED, System.currentTimeMillis())
                     val cooling = if (p.getBoolean(IndexWorker.KEY_COOLING, false)) p.getFloat(IndexWorker.KEY_TEMP, 0f) else null
+                    val priority = p.getString(IndexWorker.KEY_PRIORITY)
                     wasIndexing = true
                     index = null
+                    if (done % 160 == 0) launch(Dispatchers.IO) {
+                        val until = store.oldestDate()
+                        _state.update { it.copy(indexedUntil = until) }
+                    }
                     _state.update {
                         it.copy(
-                            indexProgress = IndexProgress(done, total, started, cooling),
+                            indexProgress = IndexProgress(done, total, started, cooling, priority),
                             indexedImages = if (total > 0) (it.totalImages - (total - done)).coerceAtLeast(0) else it.indexedImages,
                         )
                     }
@@ -276,61 +305,149 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun setExample(uri: Uri?) = _state.update { it.copy(exampleUri = uri) }
+
     fun search() {
         val s = _state.value
         if (s.searching) return
         val parsed = QueryParser.parse(s.query)
         val dateFilter = s.manualRange ?: parsed.date
-        if (parsed.text.isBlank() && dateFilter == null) {
-            _state.update { it.copy(message = "Descreva a foto ou informe um período.") }
+        val example = s.exampleUri
+        if (example == null && parsed.text.isBlank() && dateFilter == null) {
+            _state.update { it.copy(message = "Descreva a foto, escolha uma foto de exemplo ou informe um período.") }
             return
         }
         _state.update { it.copy(searching = true) }
         viewModelScope.launch {
             try {
-                val zone = ZoneId.systemDefault()
-                fun toDate(ms: Long) = Instant.ofEpochMilli(ms).atZone(zone).toLocalDate()
-
-                val result = if (parsed.text.isBlank()) {
-                    // Só data: não precisa de IA, usa a galeria inteira.
-                    val hits = images.asSequence()
-                        .filter { dateFilter!!.matches(toDate(it.dateTaken)) }
-                        .sortedByDescending { it.dateTaken }
-                        .map { Hit(it.id, it.uri, 1f, it.dateTaken) }
-                        .toList()
-                    SearchResult(s.query, "", dateFilter?.label, false, hits, 0f, false)
-                } else {
-                    val ptText = applyGlossary(parsed.text)
-                    val english = runCatching { translator.translate(ptText) }.getOrDefault(ptText)
-                    val idx = loadIndex()
-                    val hits = withContext(Dispatchers.Default) {
-                        val q = textQuery(english)
-                        val scores = idx.scores(q)
-                        val list = ArrayList<Hit>()
-                        for (i in 0 until idx.size) {
-                            if (scores[i] < MIN_SCORE) continue
-                            if (dateFilter != null && !dateFilter.matches(toDate(idx.dates[i]))) continue
-                            list += Hit(idx.ids[i], media.uriFor(idx.ids[i]), scores[i], idx.dates[i])
+                val result = when {
+                    example != null -> {
+                        val vec = withContext(Dispatchers.Default) {
+                            val bmp = withContext(Dispatchers.IO) { media.decodeSampled(example) }
+                            try { clip.embedImage(clip.preprocess(bmp)) } finally { bmp.recycle() }
                         }
-                        list.sortByDescending { it.score }
-                        list
+                        vectorSearch(vec, SearchMode.IMAGE, dateFilter, s.query, "", example)
                     }
-                    val top = hits.firstOrNull()?.score ?: 0f
-                    val suggested = (top - 0.05f).coerceIn(0.21f, 0.30f)
-                    SearchResult(
-                        s.query, english, dateFilter?.label, true, hits, suggested,
-                        partialIndex = _state.value.indexedImages < _state.value.totalImages,
-                    )
+                    parsed.text.isBlank() -> {
+                        // Só data: não precisa de IA, usa a galeria inteira.
+                        val hits = images.asSequence()
+                            .filter { dateFilter!!.matches(toDate(it.dateTaken)) }
+                            .sortedByDescending { it.dateTaken }
+                            .map { Hit(it.id, it.uri, 1f, it.dateTaken) }
+                            .toList()
+                        SearchResult(s.query, "", dateFilter?.label, SearchMode.DATE, hits, 0f)
+                    }
+                    else -> {
+                        val ptText = applyGlossary(parsed.text)
+                        val english = runCatching { translator.translate(ptText) }.getOrDefault(ptText)
+                        val vec = withContext(Dispatchers.Default) { textQuery(english) }
+                        vectorSearch(vec, SearchMode.TEXT, dateFilter, s.query, english, null)
+                    }
                 }
-                _state.update {
-                    it.copy(
-                        searching = false, result = result, screen = Screen.RESULTS,
-                        threshold = result.suggestedThreshold, excluded = emptySet(),
-                    )
-                }
+                showResult(result)
             } catch (e: Throwable) {
                 _state.update { it.copy(searching = false, message = "Erro na busca: ${e.message}") }
             }
+        }
+    }
+
+    /** "Parecidas com esta": usa o vetor que a foto já tem no índice (instantâneo). */
+    fun searchSimilarTo(hit: Hit) {
+        if (_state.value.searching) return
+        _state.update { it.copy(searching = true) }
+        viewModelScope.launch {
+            try {
+                val idx = loadIndex()
+                val pos = idx.ids.indexOf(hit.id)
+                val vec = if (pos >= 0) {
+                    idx.vectors.copyOfRange(pos * ClipModel.EMBED_DIM, (pos + 1) * ClipModel.EMBED_DIM)
+                } else withContext(Dispatchers.Default) {
+                    val bmp = withContext(Dispatchers.IO) { media.loadThumbnail(hit.uri) }
+                    try { clip.embedImage(clip.preprocess(bmp)) } finally { bmp.recycle() }
+                }
+                showResult(vectorSearch(vec, SearchMode.IMAGE, null, "Parecidas com uma foto", "", hit.uri))
+            } catch (e: Throwable) {
+                _state.update { it.copy(searching = false, message = "Erro na busca: ${e.message}") }
+            }
+        }
+    }
+
+    private fun showResult(result: SearchResult) = _state.update {
+        it.copy(
+            searching = false, result = result, screen = Screen.RESULTS,
+            threshold = result.suggestedThreshold, excluded = emptySet(),
+        )
+    }
+
+    private val zone: ZoneId get() = ZoneId.systemDefault()
+    private fun toDate(ms: Long): LocalDate = Instant.ofEpochMilli(ms).atZone(zone).toLocalDate()
+
+    private suspend fun vectorSearch(
+        q: FloatArray,
+        mode: SearchMode,
+        dateFilter: DateFilter?,
+        originalQuery: String,
+        english: String,
+        exampleUri: Uri?,
+    ): SearchResult {
+        val idx = loadIndex()
+        val minScore = if (mode == SearchMode.IMAGE) MIN_SCORE_IMAGE else MIN_SCORE
+        val hits = withContext(Dispatchers.Default) {
+            val scores = idx.scores(q)
+            val list = ArrayList<Hit>()
+            for (i in 0 until idx.size) {
+                if (scores[i] < minScore) continue
+                if (dateFilter != null && !dateFilter.matches(toDate(idx.dates[i]))) continue
+                list += Hit(idx.ids[i], media.uriFor(idx.ids[i]), scores[i], idx.dates[i])
+            }
+            list.sortByDescending { it.score }
+            list
+        }
+        val top = hits.firstOrNull()?.score ?: 0f
+        val suggested = if (mode == SearchMode.IMAGE) {
+            // a própria foto (se estiver na galeria) dá ~1.0; parecidas costumam ficar acima de 0.8
+            0.80f
+        } else (top - 0.05f).coerceIn(0.21f, 0.30f)
+
+        // Cobertura: o que ainda falta analisar
+        val st = _state.value
+        var coverage: String? = null
+        var pending = 0
+        if (st.indexedImages < st.totalImages) {
+            coverage = coverageText(st)
+            if (dateFilter != null) {
+                val indexedIds = withContext(Dispatchers.IO) { store.allIds() }
+                pending = images.count { it.id !in indexedIds && dateFilter.matches(toDate(it.dateTaken)) }
+            }
+        }
+        return SearchResult(
+            originalQuery, english, dateFilter?.label, mode, hits, suggested,
+            coverage = coverage,
+            pendingInRange = pending,
+            pendingFilter = dateFilter.takeIf { pending > 0 },
+            exampleUri = exampleUri,
+        )
+    }
+
+    fun coverageText(st: UiState): String {
+        val pct = if (st.totalImages == 0) 0 else st.indexedImages * 100 / st.totalImages
+        val until = st.indexedUntil?.let { ms ->
+            val d = toDate(ms)
+            " (das mais recentes até ${MONTHS[d.monthValue - 1]}/${d.year})"
+        } ?: ""
+        return "A IA analisou $pct% da galeria$until."
+    }
+
+    /** Analisa primeiro as fotos do período buscado. */
+    fun prioritize(filter: DateFilter) {
+        val from = filter.start?.atStartOfDay(zone)?.toInstant()?.toEpochMilli() ?: Long.MIN_VALUE
+        val to = filter.end?.plusDays(1)?.atStartOfDay(zone)?.toInstant()?.toEpochMilli()?.minus(1) ?: Long.MAX_VALUE
+        IndexWorker.startPriority(getApplication(), from, to, filter.monthOfYear ?: 0, filter.label)
+        _state.update {
+            it.copy(
+                screen = Screen.HOME,
+                message = "Analisando ${filter.label} primeiro. Busque de novo quando terminar.",
+            )
         }
     }
 
@@ -417,6 +534,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     keep = groups.mapTo(HashSet()) { g -> g.first().id },
                     selected = groups.flatMap { g -> g.drop(1) }.mapTo(HashSet()) { h -> h.id },
                     partialIndex = it.indexedImages < it.totalImages,
+                    coverage = if (it.indexedImages < it.totalImages) coverageText(it) else null,
                 )
             )
         }
@@ -556,6 +674,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     companion object {
         private const val CHUNK = 500
         private const val MIN_SCORE = 0.15f
+        private const val MIN_SCORE_IMAGE = 0.55f
+        private val MONTHS = listOf("jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez")
         private val GLOSSARY = listOf(
             Regex("(?i)\\bprints\\b") to "capturas de tela",
             Regex("(?i)\\bprint\\b") to "captura de tela",

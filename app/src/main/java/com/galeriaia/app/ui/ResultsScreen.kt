@@ -79,6 +79,10 @@ fun ResultsScreen(state: UiState, vm: MainViewModel, snackbar: @Composable () ->
     var preview by remember { mutableStateOf<Hit?>(null) }
     var showMove by remember { mutableStateOf(false) }
 
+    if (state.searching) {
+        AlertDialog(onDismissRequest = {}, confirmButton = {}, text = { Text("Buscando parecidas…") })
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -131,14 +135,14 @@ fun ResultsScreen(state: UiState, vm: MainViewModel, snackbar: @Composable () ->
         snackbarHost = snackbar,
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
-            SearchInfo(result)
+            SearchInfo(result, vm::prioritize)
 
             if (result.semantic) {
                 Column(Modifier.padding(horizontal = 16.dp)) {
                     Slider(
                         value = state.threshold,
                         onValueChange = vm::setThreshold,
-                        valueRange = 0.15f..0.35f,
+                        valueRange = result.sliderRange,
                     )
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                         Text("◀ mais resultados", style = MaterialTheme.typography.labelSmall)
@@ -180,7 +184,14 @@ fun ResultsScreen(state: UiState, vm: MainViewModel, snackbar: @Composable () ->
         }
     }
 
-    preview?.let { hit -> PreviewDialog(hit, selected = hit.id !in state.excluded, onToggle = { vm.toggle(hit.id) }) { preview = null } }
+    preview?.let { hit ->
+        PreviewDialog(
+            hit,
+            selected = hit.id !in state.excluded,
+            onToggle = { vm.toggle(hit.id) },
+            onFindSimilar = { vm.searchSimilarTo(hit) },
+        ) { preview = null }
+    }
 
     if (showMove) {
         MoveDialog(
@@ -196,7 +207,7 @@ fun ResultsScreen(state: UiState, vm: MainViewModel, snackbar: @Composable () ->
 }
 
 @Composable
-private fun SearchInfo(result: SearchResult) {
+private fun SearchInfo(result: SearchResult, onPrioritize: (com.galeriaia.app.search.DateFilter) -> Unit) {
     Column(
         Modifier
             .fillMaxWidth()
@@ -205,20 +216,41 @@ private fun SearchInfo(result: SearchResult) {
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .padding(12.dp),
     ) {
+        if (result.exampleUri != null) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                AsyncImage(
+                    model = result.exampleUri,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.size(48.dp).clip(RoundedCornerShape(8.dp)),
+                )
+                Spacer(Modifier.width(10.dp))
+                Text("Fotos parecidas com esta", style = MaterialTheme.typography.bodyMedium)
+            }
+        }
         if (result.englishText.isNotBlank()) {
             Text("IA buscou: \"${result.englishText}\"", style = MaterialTheme.typography.bodyMedium)
         }
         result.dateLabel?.let { Text("Período: $it", style = MaterialTheme.typography.bodyMedium) }
-        if (result.partialIndex) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 4.dp)) {
+        result.coverage?.let { cov ->
+            Row(verticalAlignment = Alignment.Top, modifier = Modifier.padding(top = 6.dp)) {
                 Icon(Icons.Default.Info, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.error)
                 Spacer(Modifier.width(6.dp))
                 Text(
-                    "Galeria ainda não toda indexada: resultados parciais.",
+                    "Resultados parciais. $cov",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
             }
+        }
+        val pf = result.pendingFilter
+        if (pf != null && result.pendingInRange > 0) {
+            Text(
+                "${result.pendingInRange} fotos de ${pf.label} ainda não foram analisadas.",
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            TextButton(onClick = { onPrioritize(pf) }) { Text("Analisar ${pf.label} agora") }
         }
     }
 }
@@ -264,7 +296,13 @@ internal fun Thumb(
 }
 
 @Composable
-internal fun PreviewDialog(hit: Hit, selected: Boolean, onToggle: () -> Unit, onDismiss: () -> Unit) {
+internal fun PreviewDialog(
+    hit: Hit,
+    selected: Boolean,
+    onToggle: () -> Unit,
+    onFindSimilar: (() -> Unit)? = null,
+    onDismiss: () -> Unit,
+) {
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(Modifier.fillMaxWidth().padding(12.dp), shape = RoundedCornerShape(16.dp)) {
             Column {
@@ -282,6 +320,7 @@ internal fun PreviewDialog(hit: Hit, selected: Boolean, onToggle: () -> Unit, on
                         Instant.ofEpochMilli(hit.dateTaken).atZone(ZoneId.systemDefault()).format(DATE_FMT),
                         modifier = Modifier.weight(1f),
                     )
+                    if (onFindSimilar != null) TextButton(onClick = { onDismiss(); onFindSimilar() }) { Text("Parecidas") }
                     TextButton(onClick = onToggle) { Text(if (selected) "Desmarcar" else "Marcar") }
                     TextButton(onClick = onDismiss) { Text("Fechar") }
                 }

@@ -1,5 +1,13 @@
 package com.galeriaia.app.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
+import coil.compose.AsyncImage
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -278,6 +286,16 @@ private fun IndexCard(state: UiState, vm: MainViewModel, onStartIndexing: () -> 
                 prog != null -> {
                     val elapsed = System.currentTimeMillis() - prog.startedAt
                     val eta = if (prog.done > 0) elapsed / prog.done * (prog.total - prog.done) / 1000 else -1
+                    if (prog.priorityLabel != null) Text(
+                        "Analisando primeiro: ${prog.priorityLabel}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    if (indexed > 0) Text(
+                        "Já dá para buscar! ${vm.coverageText(state)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
                     Text(
                         when {
                             prog.total == 0 -> "Iniciando…"
@@ -318,6 +336,9 @@ private fun formatEta(seconds: Long): String = when {
 @Composable
 private fun SearchArea(state: UiState, vm: MainViewModel) {
     var showPicker by remember { mutableStateOf(false) }
+    val photoPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) vm.setExample(uri)
+    }
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         OutlinedTextField(
@@ -336,6 +357,36 @@ private fun SearchArea(state: UiState, vm: MainViewModel) {
                 }
             },
         )
+
+        // Foto de exemplo
+        if (state.exampleUri != null) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                AsyncImage(
+                    model = state.exampleUri,
+                    contentDescription = "Foto de exemplo",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.size(64.dp).clip(RoundedCornerShape(10.dp)),
+                )
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("Buscar fotos parecidas com esta", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "A descrição acima é usada só para datas (ex.: \"em 2024\").",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                IconButton(onClick = { vm.setExample(null) }) { Icon(Icons.Default.Close, "Remover foto") }
+            }
+        } else {
+            AssistChip(
+                onClick = {
+                    photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                },
+                label = { Text("Usar foto de exemplo") },
+                leadingIcon = { Icon(Icons.Default.Add, null, Modifier.size(18.dp)) },
+            )
+        }
 
         Row(verticalAlignment = Alignment.CenterVertically) {
             AssistChip(

@@ -51,6 +51,11 @@ class IndexWorker(context: Context, params: WorkerParameters) : CoroutineWorker(
         const val KEY_STARTED = "started"
         const val KEY_COOLING = "cooling"
         const val KEY_TEMP = "temp"
+        const val KEY_PRIORITY = "priority"
+        private const val IN_FROM = "from"
+        private const val IN_TO = "to"
+        private const val IN_MONTH = "month"
+        private const val IN_LABEL = "label"
 
         private const val CHANNEL = "indexacao"
         private const val NOTIF_ID = 1001
@@ -66,6 +71,18 @@ class IndexWorker(context: Context, params: WorkerParameters) : CoroutineWorker(
             WorkManager.getInstance(ctx).enqueueUniqueWork(
                 UNIQUE_MANUAL, ExistingWorkPolicy.KEEP,
                 OneTimeWorkRequestBuilder<IndexWorker>().addTag(TAG).addTag(TAG_MANUAL).build()
+            )
+        }
+
+        /**
+         * Analisa primeiro as fotos de um período (ex.: o que a pessoa acabou de buscar) e depois o resto.
+         * [fromMs]..[toMs] em milissegundos, ou [month] (1-12) para "esse mês em qualquer ano".
+         */
+        fun startPriority(ctx: Context, fromMs: Long, toMs: Long, month: Int, label: String) {
+            val data = workDataOf(IN_FROM to fromMs, IN_TO to toMs, IN_MONTH to month, IN_LABEL to label)
+            WorkManager.getInstance(ctx).enqueueUniqueWork(
+                UNIQUE_MANUAL, ExistingWorkPolicy.REPLACE,
+                OneTimeWorkRequestBuilder<IndexWorker>().setInputData(data).addTag(TAG).addTag(TAG_MANUAL).build()
             )
         }
 
@@ -112,8 +129,25 @@ class IndexWorker(context: Context, params: WorkerParameters) : CoroutineWorker(
         val current = images.mapTo(HashSet()) { it.id }
         withContext(Dispatchers.IO) { store.delete(indexed.filter { it !in current }) }
 
-        val todo = images.filter { it.id !in indexed }
+        var todo = images.filter { it.id !in indexed }
         if (todo.isEmpty()) return Result.success()
+
+        // Período prioritário: essas fotos vão para o começo da fila
+        val priorityLabel = inputData.getString(IN_LABEL)
+        var priorityCount = 0
+        if (priorityLabel != null) {
+            val from = inputData.getLong(IN_FROM, Long.MIN_VALUE)
+            val to = inputData.getLong(IN_TO, Long.MAX_VALUE)
+            val month = inputData.getInt(IN_MONTH, 0)
+            val zone = java.time.ZoneId.systemDefault()
+            val inRange = { ms: Long ->
+                if (month > 0) java.time.Instant.ofEpochMilli(ms).atZone(zone).monthValue == month
+                else ms in from..to
+            }
+            val (first, rest) = todo.partition { inRange(it.dateTaken) }
+            priorityCount = first.size
+            todo = first + rest
+        }
 
         runCatching { setForeground(foregroundInfo(if (Prefs.fastMode(ctx)) "Analisando (modo rápido)…" else "Analisando fotos…", 0, todo.size)) }
         val started = System.currentTimeMillis()
@@ -143,7 +177,11 @@ class IndexWorker(context: Context, params: WorkerParameters) : CoroutineWorker(
                 }
                 withContext(Dispatchers.IO) { store.insert(entries) }
                 done += chunk.size
-                setProgress(workDataOf(KEY_DONE to done, KEY_TOTAL to todo.size, KEY_STARTED to started))
+                setProgress(
+                    if (priorityLabel != null && done < priorityCount)
+                        workDataOf(KEY_DONE to done, KEY_TOTAL to todo.size, KEY_STARTED to started, KEY_PRIORITY to priorityLabel)
+                    else workDataOf(KEY_DONE to done, KEY_TOTAL to todo.size, KEY_STARTED to started)
+                )
                 if (done % 160 == 0 || done == todo.size) {
                     runCatching { setForeground(foregroundInfo("Analisando fotos…", done, todo.size)) }
                 }
