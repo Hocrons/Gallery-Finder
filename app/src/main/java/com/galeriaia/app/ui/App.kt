@@ -12,6 +12,23 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.Icon
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import com.galeriaia.app.ui.files.FilesRoot
+import com.galeriaia.app.ui.files.FilesScreen
+import com.galeriaia.app.ui.files.FilesViewModel
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.AlertDialog
@@ -61,9 +78,13 @@ fun openAppSettings(ctx: Context) {
     )
 }
 
+enum class Tab { PHOTOS, FILES }
+
 @Composable
-fun App(vm: MainViewModel = viewModel()) {
+fun App(vm: MainViewModel = viewModel(), filesVm: FilesViewModel = viewModel()) {
     val state by vm.state.collectAsState()
+    val filesState by filesVm.state.collectAsState()
+    var tab by rememberSaveable { mutableStateOf(Tab.PHOTOS) }
     val ctx = LocalContext.current
     val snackbar = remember { SnackbarHostState() }
 
@@ -84,7 +105,10 @@ fun App(vm: MainViewModel = viewModel()) {
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     DisposableEffect(lifecycle) {
         val obs = LifecycleEventObserver { _, e ->
-            if (e == Lifecycle.Event.ON_RESUME) vm.onPermission(currentPermission(ctx))
+            if (e == Lifecycle.Event.ON_RESUME) {
+                vm.onPermission(currentPermission(ctx))
+                filesVm.refreshAccess()
+            }
         }
         lifecycle.addObserver(obs)
         onDispose { lifecycle.removeObserver(obs) }
@@ -117,10 +141,20 @@ fun App(vm: MainViewModel = viewModel()) {
         }
     }
 
-    BackHandler(enabled = state.screen != Screen.HOME) { vm.back() }
+    BackHandler(enabled = tab == Tab.PHOTOS && state.screen != Screen.HOME) { vm.back() }
+    BackHandler(enabled = tab == Tab.FILES && filesState.screen != FilesScreen.HOME) { filesVm.back() }
+    BackHandler(enabled = tab == Tab.FILES && filesState.screen == FilesScreen.HOME) { tab = Tab.PHOTOS }
 
-    Box(Modifier.fillMaxSize()) {
-        when (state.screen) {
+    val showBar = (tab == Tab.PHOTOS && state.screen == Screen.HOME) ||
+        (tab == Tab.FILES && filesState.screen == FilesScreen.HOME)
+
+    Column(Modifier.fillMaxSize()) {
+    Box(
+        Modifier.weight(1f).fillMaxWidth()
+            .then(if (showBar) Modifier.consumeWindowInsets(WindowInsets.navigationBars) else Modifier)
+    ) {
+        if (tab == Tab.FILES) FilesRoot(filesVm, filesState)
+        else when (state.screen) {
             Screen.HOME -> HomeScreen(
                 state = state,
                 vm = vm,
@@ -132,6 +166,23 @@ fun App(vm: MainViewModel = viewModel()) {
             Screen.RESULTS -> ResultsScreen(state = state, vm = vm, snackbar = { SnackbarHost(snackbar) })
             Screen.DUPLICATES -> DuplicatesScreen(state = state, vm = vm, snackbar = { SnackbarHost(snackbar) })
         }
+    }
+    if (showBar) {
+        NavigationBar {
+            NavigationBarItem(
+                selected = tab == Tab.PHOTOS,
+                onClick = { tab = Tab.PHOTOS },
+                icon = { Icon(Icons.Default.Search, null) },
+                label = { Text("Fotos") },
+            )
+            NavigationBarItem(
+                selected = tab == Tab.FILES,
+                onClick = { tab = Tab.FILES },
+                icon = { Icon(Icons.AutoMirrored.Filled.List, null) },
+                label = { Text("Arquivos") },
+            )
+        }
+    }
     }
 
     state.busy?.let { text ->

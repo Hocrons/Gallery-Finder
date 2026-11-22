@@ -23,6 +23,7 @@ import com.galeriaia.app.MainActivity
 import com.galeriaia.app.data.EmbeddingStore
 import com.galeriaia.app.data.MediaRepository
 import com.galeriaia.app.data.Prefs
+import com.galeriaia.app.data.VideoRepository
 import com.galeriaia.app.ml.ClipModel
 import com.galeriaia.app.ml.ModelFiles
 import kotlinx.coroutines.Dispatchers
@@ -52,6 +53,8 @@ class IndexWorker(context: Context, params: WorkerParameters) : CoroutineWorker(
         const val KEY_COOLING = "cooling"
         const val KEY_TEMP = "temp"
         const val KEY_PRIORITY = "priority"
+        const val KEY_PHASE = "phase"
+        const val PHASE_VIDEOS = "videos"
         private const val IN_FROM = "from"
         private const val IN_TO = "to"
         private const val IN_MONTH = "month"
@@ -130,7 +133,7 @@ class IndexWorker(context: Context, params: WorkerParameters) : CoroutineWorker(
         withContext(Dispatchers.IO) { store.delete(indexed.filter { it !in current }) }
 
         var todo = images.filter { it.id !in indexed }
-        if (todo.isEmpty()) return Result.success()
+        if (todo.isEmpty()) return indexVideos(ctx)
 
         // Período prioritário: essas fotos vão para o começo da fila
         val priorityLabel = inputData.getString(IN_LABEL)
@@ -184,6 +187,60 @@ class IndexWorker(context: Context, params: WorkerParameters) : CoroutineWorker(
                 )
                 if (done % 160 == 0 || done == todo.size) {
                     runCatching { setForeground(foregroundInfo("Analisando fotos…", done, todo.size)) }
+                }
+            }
+        }
+        if (isStopped) return Result.success()
+        return indexVideos(ctx)
+    }
+
+    /** Segunda fase: vídeos (3 quadros por vídeo, vetor = média dos quadros). */
+    private suspend fun indexVideos(ctx: Context): Result {
+        val videos = VideoRepository(ctx)
+        val store = EmbeddingStore.videos(ctx)
+        val all = withContext(Dispatchers.IO) { runCatching { videos.queryVideos() }.getOrDefault(emptyList()) }
+        val indexed = withContext(Dispatchers.IO) { store.allIds() }
+        val current = all.mapTo(HashSet()) { it.id }
+        withContext(Dispatchers.IO) { store.delete(indexed.filter { it !in current }) }
+        val todo = all.filter { it.id !in indexed }
+        if (todo.isEmpty()) return Result.success()
+
+        runCatching { setForeground(foregroundInfo("Analisando vídeos…", 0, todo.size)) }
+        val started = System.currentTimeMillis()
+        var done = 0
+        val fast = Prefs.fastMode(ctx)
+        ClipModel(ModelFiles.dir(ctx.filesDir), if (fast) THREADS_FAST else THREADS_NORMAL).use { clip ->
+            for (chunk in todo.chunked(4)) {
+                if (isStopped) break
+                if (!fast) coolDownIfHot(ctx, done, todo.size, started)
+                val entries = coroutineScope {
+                    val frames = chunk.map { v ->
+                        async(Dispatchers.IO) {
+                            runCatching {
+                                videos.frames(v.uri, v.durationMs).map { bmp ->
+                                    try { clip.preprocess(bmp) } finally { bmp.recycle() }
+                                }
+                            }.getOrDefault(emptyList())
+                        }
+                    }.awaitAll()
+                    chunk.mapIndexed { i, v ->
+                        val vecs = frames[i].mapNotNull { runCatching { clip.embedImage(it) }.getOrNull() }
+                        val avg = FloatArray(ClipModel.EMBED_DIM)
+                        for (vec in vecs) for (k in avg.indices) avg[k] += vec[k]
+                        var n = 0f
+                        for (x in avg) n += x * x
+                        n = kotlin.math.sqrt(n)
+                        if (n > 0f) for (k in avg.indices) avg[k] /= n
+                        EmbeddingStore.Entry(v.id, v.dateTaken, avg)
+                    }
+                }
+                withContext(Dispatchers.IO) { store.insert(entries) }
+                done += chunk.size
+                setProgress(
+                    workDataOf(KEY_DONE to done, KEY_TOTAL to todo.size, KEY_STARTED to started, KEY_PHASE to PHASE_VIDEOS)
+                )
+                if (done % 40 == 0 || done == todo.size) {
+                    runCatching { setForeground(foregroundInfo("Analisando vídeos…", done, todo.size)) }
                 }
             }
         }

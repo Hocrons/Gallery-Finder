@@ -73,6 +73,7 @@ dependencies {
 
     // Miniaturas na grade
     implementation("io.coil-kt:coil-compose:2.7.0")
+    implementation("io.coil-kt:coil-video:2.7.0")
     // IA no celular (CLIP)
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
     // Tradução PT -> EN offline

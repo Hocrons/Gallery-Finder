@@ -306,7 +306,8 @@ private fun IndexCard(state: UiState, vm: MainViewModel, onStartIndexing: () -> 
                         when {
                             prog.total == 0 -> "Iniciando…"
                             prog.coolingTemp != null -> "Pausado para esfriar (%.0f °C) · ${prog.done}/${prog.total}".format(prog.coolingTemp)
-                            else -> "Analisando ${prog.done}/${prog.total}" + if (eta >= 0) " · ~${formatEta(eta)} restantes" else ""
+                            else -> (if (prog.videos) "Fotos prontas ✔ Analisando vídeos " else "Analisando ") +
+                                "${prog.done}/${prog.total}" + if (eta >= 0) " · ~${formatEta(eta)} restantes" else ""
                         },
                         style = MaterialTheme.typography.bodySmall,
                     )

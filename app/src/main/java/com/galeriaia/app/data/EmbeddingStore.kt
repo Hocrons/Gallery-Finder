@@ -34,8 +34,13 @@ class EmbeddingIndex(
     }
 }
 
-class EmbeddingStore(context: Context) :
-    SQLiteOpenHelper(context, "embeddings.db", null, 1) {
+class EmbeddingStore(context: Context, dbName: String = "embeddings.db") :
+    SQLiteOpenHelper(context, dbName, null, 1) {
+
+    companion object {
+        /** Banco separado para os vídeos (mesmo formato). */
+        fun videos(context: Context) = EmbeddingStore(context, "video_embeddings.db")
+    }
 
     data class Entry(val id: Long, val dateTaken: Long, val vector: FloatArray)
 

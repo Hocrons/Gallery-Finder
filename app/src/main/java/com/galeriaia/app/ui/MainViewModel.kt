@@ -76,6 +76,8 @@ data class IndexProgress(
     val startedAt: Long,
     val coolingTemp: Float? = null,
     val priorityLabel: String? = null,
+    /** true = fase de vídeos (as fotos já terminaram). */
+    val videos: Boolean = false,
 )
 
 data class UpdateUi(
@@ -249,6 +251,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     val started = p.getLong(IndexWorker.KEY_STARTED, System.currentTimeMillis())
                     val cooling = if (p.getBoolean(IndexWorker.KEY_COOLING, false)) p.getFloat(IndexWorker.KEY_TEMP, 0f) else null
                     val priority = p.getString(IndexWorker.KEY_PRIORITY)
+                    val isVideos = p.getString(IndexWorker.KEY_PHASE) == IndexWorker.PHASE_VIDEOS
                     wasIndexing = true
                     index = null
                     if (done % 160 == 0) launch(Dispatchers.IO) {
@@ -257,8 +260,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     _state.update {
                         it.copy(
-                            indexProgress = IndexProgress(done, total, started, cooling, priority),
-                            indexedImages = if (total > 0) (it.totalImages - (total - done)).coerceAtLeast(0) else it.indexedImages,
+                            indexProgress = IndexProgress(done, total, started, cooling, priority, isVideos),
+                            indexedImages = when {
+                                isVideos -> it.totalImages
+                                total > 0 -> (it.totalImages - (total - done)).coerceAtLeast(0)
+                                else -> it.indexedImages
+                            },
                         )
                     }
                 }
